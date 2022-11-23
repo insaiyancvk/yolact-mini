@@ -8,9 +8,9 @@ import numpy as np
 import torch, sys, cv2
 import torch.backends.cudnn as cudnn
 
-from nutils.yolact import Yolact
-from nutils.output_utils import postprocess
-from nutils.config import cfg
+from utils.yolact import Yolact
+from utils.output_utils import postprocess
+from utils.config import cfg
 
 
 def calc_size_preserve_ar(img_w, img_h, max_size):
