@@ -8,14 +8,12 @@ from math import sqrt
 from typing import List
 from collections import defaultdict
 
-from data.config import cfg, mask_type
-from layers import Detect
-# from layers.interpolate import InterpolateModule
-from backbone import construct_backbone
+from .config import cfg, mask_type
+from .output_utils import Detect, construct_backbone, make_net
 
 # import torch.backends.cudnn as cudnn
-from utils import timer
-from utils.functions import MovingAverage, make_net
+from . import timer
+# from output_utils import MovingAverage, 
 
 # This is required for Pytorch 1.0.1 on Windows to initialize Cuda on some driver versions.
 # See the bug report here: https://github.com/pytorch/pytorch/issues/17108
@@ -674,51 +672,3 @@ class Yolact(nn.Module):
                     pred_outs['conf'] = F.softmax(pred_outs['conf'], -1)
 
             return self.detect(pred_outs, self)
-
-
-
-
-# Some testing code
-if __name__ == '__main__':
-    from utils.functions import init_console
-    init_console()
-
-    # Use the first argument to set the config if you want
-    import sys
-    if len(sys.argv) > 1:
-        from data.config import set_cfg
-        set_cfg(sys.argv[1])
-
-    net = Yolact()
-    net.train()
-    net.init_weights(backbone_path='weights/' + cfg.backbone.path)
-
-    # GPU
-    # net = net.cuda()
-    # torch.set_default_tensor_type('torch.cuda.FloatTensor')
-
-    x = torch.zeros((1, 3, cfg.max_size, cfg.max_size))
-    y = net(x)
-
-    for p in net.prediction_layers:
-        print(p.last_conv_size)
-
-    print()
-    for k, a in y.items():
-        print(k + ': ', a.size(), torch.sum(a))
-    exit()
-    
-    net(x)
-    # timer.disable('pass2')
-    avg = MovingAverage()
-    try:
-        while True:
-            timer.reset()
-            with timer.env('everything else'):
-                net(x)
-            avg.add(timer.total_time())
-            print('\033[2J') # Moves console cursor to 0,0
-            timer.print_stats()
-            print('Avg fps: %.2f\tAvg ms: %.2f         ' % (1/avg.get_avg(), avg.get_avg()*1000))
-    except KeyboardInterrupt:
-        pass

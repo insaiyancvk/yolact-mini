@@ -1,6 +1,146 @@
-from backbone import ResNetBackbone, VGGBackbone, ResNetBackboneGN, DarkNetBackbone
-from math import sqrt
+# from backbone import ResNetBackbone, VGGBackbone, ResNetBackboneGN, DarkNetBackbone
+# from math import sqrt
+import torch.nn as nn
 import torch
+
+class Bottleneck(nn.Module):
+    """ Adapted from torchvision.models.resnet """
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, norm_layer=nn.BatchNorm2d, dilation=1, use_dcn=False):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False, dilation=dilation)
+        self.bn1 = norm_layer(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                            padding=dilation, bias=False, dilation=dilation)
+        self.bn2 = norm_layer(planes)
+        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False, dilation=dilation)
+        self.bn3 = norm_layer(planes * 4)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+class ResNetBackbone(nn.Module):
+    """ Adapted from torchvision.models.resnet """
+
+    def __init__(self, layers, dcn_layers=[0, 0, 0, 0], dcn_interval=1, atrous_layers=[], block=Bottleneck, norm_layer=nn.BatchNorm2d):
+        super().__init__()
+
+        # These will be populated by _make_layer
+        self.num_base_layers = len(layers)
+        self.layers = nn.ModuleList()
+        self.channels = []
+        self.norm_layer = norm_layer
+        self.dilation = 1
+        self.atrous_layers = atrous_layers
+
+        # From torchvision.models.resnet.Resnet
+        self.inplanes = 64
+        
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = norm_layer(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        self._make_layer(block, 64, layers[0], dcn_layers=dcn_layers[0], dcn_interval=dcn_interval)
+        self._make_layer(block, 128, layers[1], stride=2, dcn_layers=dcn_layers[1], dcn_interval=dcn_interval)
+        self._make_layer(block, 256, layers[2], stride=2, dcn_layers=dcn_layers[2], dcn_interval=dcn_interval)
+        self._make_layer(block, 512, layers[3], stride=2, dcn_layers=dcn_layers[3], dcn_interval=dcn_interval)
+
+        # This contains every module that should be initialized by loading in pretrained weights.
+        # Any extra layers added onto this that won't be initialized by init_backbone will not be
+        # in this list. That way, Yolact::init_weights knows which backbone weights to initialize
+        # with xavier, and which ones to leave alone.
+        self.backbone_modules = [m for m in self.modules() if isinstance(m, nn.Conv2d)]
+        
+    
+    def _make_layer(self, block, planes, blocks, stride=1, dcn_layers=0, dcn_interval=1):
+        """ Here one layer means a string of n Bottleneck blocks. """
+        downsample = None
+
+        # This is actually just to create the connection between layers, and not necessarily to
+        # downsample. Even if the second condition is met, it only downsamples when stride != 1
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            if len(self.layers) in self.atrous_layers:
+                self.dilation += 1
+                stride = 1
+            
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False,
+                          dilation=self.dilation),
+                self.norm_layer(planes * block.expansion),
+            )
+
+        layers = []
+        use_dcn = (dcn_layers >= blocks)
+        layers.append(block(self.inplanes, planes, stride, downsample, self.norm_layer, self.dilation, use_dcn=use_dcn))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            use_dcn = ((i+dcn_layers) >= blocks) and (i % dcn_interval == 0)
+            layers.append(block(self.inplanes, planes, norm_layer=self.norm_layer, use_dcn=use_dcn))
+        layer = nn.Sequential(*layers)
+
+        self.channels.append(planes * block.expansion)
+        self.layers.append(layer)
+
+        return layer
+
+    def forward(self, x):
+        """ Returns a list of convouts for each layer. """
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        outs = []
+        for layer in self.layers:
+            x = layer(x)
+            outs.append(x)
+
+        return tuple(outs)
+
+    def init_backbone(self, path):
+        """ Initializes the backbone weights for training. """
+        state_dict = torch.load(path)
+
+        # Replace layer1 -> layers.0 etc.
+        keys = list(state_dict)
+        for key in keys:
+            if key.startswith('layer'):
+                idx = int(key[5])
+                new_key = 'layers.' + str(idx-1) + key[6:]
+                state_dict[new_key] = state_dict.pop(key)
+
+        # Note: Using strict=False is berry scary. Triple check this.
+        self.load_state_dict(state_dict, strict=False)
+
+    def add_layer(self, conv_channels=1024, downsample=2, depth=1, block=Bottleneck):
+        """ Add a downsample layer to the backbone as per what SSD does. """
+        self._make_layer(block, conv_channels // block.expansion, blocks=depth, stride=downsample)
 
 # for making bounding boxes pretty
 COLORS = ((244,  67,  54),
@@ -235,137 +375,13 @@ resnet101_backbone = backbone_base.copy({
     'pred_aspect_ratios': [ [[0.66685089, 1.7073535, 0.87508774, 1.16524493, 0.49059086]] ] * 6,
 })
 
-resnet101_gn_backbone = backbone_base.copy({
-    'name': 'ResNet101_GN',
-    'path': 'R-101-GN.pkl',
-    'type': ResNetBackboneGN,
-    'args': ([3, 4, 23, 3],),
-    'transform': resnet_transform,
-
-    'selected_layers': list(range(2, 8)),
-    'pred_scales': [[1]]*6,
-    'pred_aspect_ratios': [ [[0.66685089, 1.7073535, 0.87508774, 1.16524493, 0.49059086]] ] * 6,
-})
-
-resnet101_dcn_inter3_backbone = resnet101_backbone.copy({
-    'name': 'ResNet101_DCN_Interval3',
-    'args': ([3, 4, 23, 3], [0, 4, 23, 3], 3),
-})
-
-resnet50_backbone = resnet101_backbone.copy({
-    'name': 'ResNet50',
-    'path': 'resnet50-19c8e357.pth',
-    'type': ResNetBackbone,
-    'args': ([3, 4, 6, 3],),
-    'transform': resnet_transform,
-})
-
-resnet50_dcnv2_backbone = resnet50_backbone.copy({
-    'name': 'ResNet50_DCNv2',
-    'args': ([3, 4, 6, 3], [0, 4, 6, 3]),
-})
-
-darknet53_backbone = backbone_base.copy({
-    'name': 'DarkNet53',
-    'path': 'darknet53.pth',
-    'type': DarkNetBackbone,
-    'args': ([1, 2, 8, 8, 4],),
-    'transform': darknet_transform,
-
-    'selected_layers': list(range(3, 9)),
-    'pred_scales': [[3.5, 4.95], [3.6, 4.90], [3.3, 4.02], [2.7, 3.10], [2.1, 2.37], [1.8, 1.92]],
-    'pred_aspect_ratios': [ [[1, sqrt(2), 1/sqrt(2), sqrt(3), 1/sqrt(3)][:n], [1]] for n in [3, 5, 5, 5, 3, 3] ],
-})
-
-vgg16_arch = [[64, 64],
-              [ 'M', 128, 128],
-              [ 'M', 256, 256, 256],
-              [('M', {'kernel_size': 2, 'stride': 2, 'ceil_mode': True}), 512, 512, 512],
-              [ 'M', 512, 512, 512],
-              [('M',  {'kernel_size': 3, 'stride':  1, 'padding':  1}),
-               (1024, {'kernel_size': 3, 'padding': 6, 'dilation': 6}),
-               (1024, {'kernel_size': 1})]]
-
-vgg16_backbone = backbone_base.copy({
-    'name': 'VGG16',
-    'path': 'vgg16_reducedfc.pth',
-    'type': VGGBackbone,
-    'args': (vgg16_arch, [(256, 2), (128, 2), (128, 1), (128, 1)], [3]),
-    'transform': vgg_transform,
-
-    'selected_layers': [3] + list(range(5, 10)),
-    'pred_scales': [[5, 4]]*6,
-    'pred_aspect_ratios': [ [[1], [1, sqrt(2), 1/sqrt(2), sqrt(3), 1/sqrt(3)][:n]] for n in [3, 5, 5, 5, 3, 3] ],
-})
-
-
-
-
 
 # ----------------------- MASK BRANCH TYPES ----------------------- #
 
 mask_type = Config({
-    # Direct produces masks directly as the output of each pred module.
-    # This is denoted as fc-mask in the paper.
-    # Parameters: mask_size, use_gt_bboxes
     'direct': 0,
-
-    # Lincomb produces coefficients as the output of each pred module then uses those coefficients
-    # to linearly combine features from a prototype network to create image-sized masks.
-    # Parameters:
-    #   - masks_to_train (int): Since we're producing (near) full image masks, it'd take too much
-    #                           vram to backprop on every single mask. Thus we select only a subset.
-    #   - mask_proto_src (int): The input layer to the mask prototype generation network. This is an
-    #                           index in backbone.layers. Use to use the image itself instead.
-    #   - mask_proto_net (list<tuple>): A list of layers in the mask proto network with the last one
-    #                                   being where the masks are taken from. Each conv layer is in
-    #                                   the form (num_features, kernel_size, **kwdargs). An empty
-    #                                   list means to use the source for prototype masks. If the
-    #                                   kernel_size is negative, this creates a deconv layer instead.
-    #                                   If the kernel_size is negative and the num_features is None,
-    #                                   this creates a simple bilinear interpolation layer instead.
-    #   - mask_proto_bias (bool): Whether to include an extra coefficient that corresponds to a proto
-    #                             mask of all ones.
-    #   - mask_proto_prototype_activation (func): The activation to apply to each prototype mask.
-    #   - mask_proto_mask_activation (func): After summing the prototype masks with the predicted
-    #                                        coeffs, what activation to apply to the final mask.
-    #   - mask_proto_coeff_activation (func): The activation to apply to the mask coefficients.
-    #   - mask_proto_crop (bool): If True, crop the mask with the predicted bbox during training.
-    #   - mask_proto_crop_expand (float): If cropping, the percent to expand the cropping bbox by
-    #                                     in each direction. This is to make the model less reliant
-    #                                     on perfect bbox predictions.
-    #   - mask_proto_loss (str [l1|disj]): If not None, apply an l1 or disjunctive regularization
-    #                                      loss directly to the prototype masks.
-    #   - mask_proto_binarize_downsampled_gt (bool): Binarize GT after dowsnampling during training?
-    #   - mask_proto_normalize_mask_loss_by_sqrt_area (bool): Whether to normalize mask loss by sqrt(sum(gt))
-    #   - mask_proto_reweight_mask_loss (bool): Reweight mask loss such that background is divided by
-    #                                           #background and foreground is divided by #foreground.
-    #   - mask_proto_grid_file (str): The path to the grid file to use with the next option.
-    #                                 This should be a numpy.dump file with shape [numgrids, h, w]
-    #                                 where h and w are w.r.t. the mask_proto_src convout.
-    #   - mask_proto_use_grid (bool): Whether to add extra grid features to the proto_net input.
-    #   - mask_proto_coeff_gate (bool): Add an extra set of sigmoided coefficients that is multiplied
-    #                                   into the predicted coefficients in order to "gate" them.
-    #   - mask_proto_prototypes_as_features (bool): For each prediction module, downsample the prototypes
-    #                                 to the convout size of that module and supply the prototypes as input
-    #                                 in addition to the already supplied backbone features.
-    #   - mask_proto_prototypes_as_features_no_grad (bool): If the above is set, don't backprop gradients to
-    #                                 to the prototypes from the network head.
-    #   - mask_proto_remove_empty_masks (bool): Remove masks that are downsampled to 0 during loss calculations.
-    #   - mask_proto_reweight_coeff (float): The coefficient to multiple the forground pixels with if reweighting.
-    #   - mask_proto_coeff_diversity_loss (bool): Apply coefficient diversity loss on the coefficients so that the same
-    #                                             instance has similar coefficients.
-    #   - mask_proto_coeff_diversity_alpha (float): The weight to use for the coefficient diversity loss.
-    #   - mask_proto_normalize_emulate_roi_pooling (bool): Normalize the mask loss to emulate roi pooling's affect on loss.
-    #   - mask_proto_double_loss (bool): Whether to use the old loss in addition to any special new losses.
-    #   - mask_proto_double_loss_alpha (float): The alpha to weight the above loss.
-    #   - mask_proto_split_prototypes_by_head (bool): If true, this will give each prediction head its own prototypes.
-    #   - mask_proto_crop_with_pred_box (bool): Whether to crop with the predicted box or the gt box.
     'lincomb': 1,
 })
-
-
-
 
 
 # ----------------------- ACTIVATION FUNCTIONS ----------------------- #
@@ -701,108 +717,6 @@ yolact_base_config = coco_base_config.copy({
     'crowd_iou_threshold': 0.7,
 
     'use_semantic_segmentation_loss': True,
-})
-
-yolact_im400_config = yolact_base_config.copy({
-    'name': 'yolact_im400',
-
-    'max_size': 400,
-    'backbone': yolact_base_config.backbone.copy({
-        'pred_scales': [[int(x[0] / yolact_base_config.max_size * 400)] for x in yolact_base_config.backbone.pred_scales],
-    }),
-})
-
-yolact_im700_config = yolact_base_config.copy({
-    'name': 'yolact_im700',
-
-    'masks_to_train': 300,
-    'max_size': 700,
-    'backbone': yolact_base_config.backbone.copy({
-        'pred_scales': [[int(x[0] / yolact_base_config.max_size * 700)] for x in yolact_base_config.backbone.pred_scales],
-    }),
-})
-
-yolact_darknet53_config = yolact_base_config.copy({
-    'name': 'yolact_darknet53',
-
-    'backbone': darknet53_backbone.copy({
-        'selected_layers': list(range(2, 5)),
-        
-        'pred_scales': yolact_base_config.backbone.pred_scales,
-        'pred_aspect_ratios': yolact_base_config.backbone.pred_aspect_ratios,
-        'use_pixel_scales': True,
-        'preapply_sqrt': False,
-        'use_square_anchors': True, # This is for backward compatability with a bug
-    }),
-})
-
-yolact_resnet50_config = yolact_base_config.copy({
-    'name': 'yolact_resnet50',
-
-    'backbone': resnet50_backbone.copy({
-        'selected_layers': list(range(1, 4)),
-        
-        'pred_scales': yolact_base_config.backbone.pred_scales,
-        'pred_aspect_ratios': yolact_base_config.backbone.pred_aspect_ratios,
-        'use_pixel_scales': True,
-        'preapply_sqrt': False,
-        'use_square_anchors': True, # This is for backward compatability with a bug
-    }),
-})
-
-
-yolact_resnet50_pascal_config = yolact_resnet50_config.copy({
-    'name': None, # Will default to yolact_resnet50_pascal
-    
-    # Dataset stuff
-    'dataset': pascal_sbd_dataset,
-    'num_classes': len(pascal_sbd_dataset.class_names) + 1,
-
-    'max_iter': 120000,
-    'lr_steps': (60000, 100000),
-    
-    'backbone': yolact_resnet50_config.backbone.copy({
-        'pred_scales': [[32], [64], [128], [256], [512]],
-        'use_square_anchors': False,
-    })
-})
-
-# ----------------------- YOLACT++ CONFIGS ----------------------- #
-
-yolact_plus_base_config = yolact_base_config.copy({
-    'name': 'yolact_plus_base',
-
-    'backbone': resnet101_dcn_inter3_backbone.copy({
-        'selected_layers': list(range(1, 4)),
-        
-        'pred_aspect_ratios': [ [[1, 1/2, 2]] ]*5,
-        'pred_scales': [[i * 2 ** (j / 3.0) for j in range(3)] for i in [24, 48, 96, 192, 384]],
-        'use_pixel_scales': True,
-        'preapply_sqrt': False,
-        'use_square_anchors': False,
-    }),
-
-    'use_maskiou': True,
-    'maskiou_net': [(8, 3, {'stride': 2}), (16, 3, {'stride': 2}), (32, 3, {'stride': 2}), (64, 3, {'stride': 2}), (128, 3, {'stride': 2})],
-    'maskiou_alpha': 25,
-    'rescore_bbox': False,
-    'rescore_mask': True,
-
-    'discard_mask_area': 5*5,
-})
-
-yolact_plus_resnet50_config = yolact_plus_base_config.copy({
-    'name': 'yolact_plus_resnet50',
-
-    'backbone': resnet50_dcnv2_backbone.copy({
-        'selected_layers': list(range(1, 4)),
-        
-        'pred_aspect_ratios': [ [[1, 1/2, 2]] ]*5,
-        'pred_scales': [[i * 2 ** (j / 3.0) for j in range(3)] for i in [24, 48, 96, 192, 384]],
-        'use_pixel_scales': True,
-        'preapply_sqrt': False,
-        'use_square_anchors': False,
-    }),
 })
 
 
