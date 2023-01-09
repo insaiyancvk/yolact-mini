@@ -1,200 +1,9 @@
-# from backbone import ResNetBackbone, VGGBackbone, ResNetBackboneGN, DarkNetBackbone
-# from math import sqrt
-import torch.nn as nn
+from .backbone import ResNetBackbone
 import torch
-
-class Bottleneck(nn.Module):
-    """ Adapted from torchvision.models.resnet """
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None, norm_layer=nn.BatchNorm2d, dilation=1, use_dcn=False):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False, dilation=dilation)
-        self.bn1 = norm_layer(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
-                            padding=dilation, bias=False, dilation=dilation)
-        self.bn2 = norm_layer(planes)
-        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False, dilation=dilation)
-        self.bn3 = norm_layer(planes * 4)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        if self.downsample is not None:
-            residual = self.downsample(x)
-
-        out += residual
-        out = self.relu(out)
-
-        return out
-
-class ResNetBackbone(nn.Module):
-    """ Adapted from torchvision.models.resnet """
-
-    def __init__(self, layers, dcn_layers=[0, 0, 0, 0], dcn_interval=1, atrous_layers=[], block=Bottleneck, norm_layer=nn.BatchNorm2d):
-        super().__init__()
-
-        # These will be populated by _make_layer
-        self.num_base_layers = len(layers)
-        self.layers = nn.ModuleList()
-        self.channels = []
-        self.norm_layer = norm_layer
-        self.dilation = 1
-        self.atrous_layers = atrous_layers
-
-        # From torchvision.models.resnet.Resnet
-        self.inplanes = 64
-        
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = norm_layer(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        
-        self._make_layer(block, 64, layers[0], dcn_layers=dcn_layers[0], dcn_interval=dcn_interval)
-        self._make_layer(block, 128, layers[1], stride=2, dcn_layers=dcn_layers[1], dcn_interval=dcn_interval)
-        self._make_layer(block, 256, layers[2], stride=2, dcn_layers=dcn_layers[2], dcn_interval=dcn_interval)
-        self._make_layer(block, 512, layers[3], stride=2, dcn_layers=dcn_layers[3], dcn_interval=dcn_interval)
-
-        # This contains every module that should be initialized by loading in pretrained weights.
-        # Any extra layers added onto this that won't be initialized by init_backbone will not be
-        # in this list. That way, Yolact::init_weights knows which backbone weights to initialize
-        # with xavier, and which ones to leave alone.
-        self.backbone_modules = [m for m in self.modules() if isinstance(m, nn.Conv2d)]
-        
-    
-    def _make_layer(self, block, planes, blocks, stride=1, dcn_layers=0, dcn_interval=1):
-        """ Here one layer means a string of n Bottleneck blocks. """
-        downsample = None
-
-        # This is actually just to create the connection between layers, and not necessarily to
-        # downsample. Even if the second condition is met, it only downsamples when stride != 1
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            if len(self.layers) in self.atrous_layers:
-                self.dilation += 1
-                stride = 1
-            
-            downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes * block.expansion,
-                          kernel_size=1, stride=stride, bias=False,
-                          dilation=self.dilation),
-                self.norm_layer(planes * block.expansion),
-            )
-
-        layers = []
-        use_dcn = (dcn_layers >= blocks)
-        layers.append(block(self.inplanes, planes, stride, downsample, self.norm_layer, self.dilation, use_dcn=use_dcn))
-        self.inplanes = planes * block.expansion
-        for i in range(1, blocks):
-            use_dcn = ((i+dcn_layers) >= blocks) and (i % dcn_interval == 0)
-            layers.append(block(self.inplanes, planes, norm_layer=self.norm_layer, use_dcn=use_dcn))
-        layer = nn.Sequential(*layers)
-
-        self.channels.append(planes * block.expansion)
-        self.layers.append(layer)
-
-        return layer
-
-    def forward(self, x):
-        """ Returns a list of convouts for each layer. """
-
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        outs = []
-        for layer in self.layers:
-            x = layer(x)
-            outs.append(x)
-
-        return tuple(outs)
-
-    def init_backbone(self, path):
-        """ Initializes the backbone weights for training. """
-        state_dict = torch.load(path)
-
-        # Replace layer1 -> layers.0 etc.
-        keys = list(state_dict)
-        for key in keys:
-            if key.startswith('layer'):
-                idx = int(key[5])
-                new_key = 'layers.' + str(idx-1) + key[6:]
-                state_dict[new_key] = state_dict.pop(key)
-
-        # Note: Using strict=False is berry scary. Triple check this.
-        self.load_state_dict(state_dict, strict=False)
-
-    def add_layer(self, conv_channels=1024, downsample=2, depth=1, block=Bottleneck):
-        """ Add a downsample layer to the backbone as per what SSD does. """
-        self._make_layer(block, conv_channels // block.expansion, blocks=depth, stride=downsample)
-
-# for making bounding boxes pretty
-COLORS = ((244,  67,  54),
-          (233,  30,  99),
-          (156,  39, 176),
-          (103,  58, 183),
-          ( 63,  81, 181),
-          ( 33, 150, 243),
-          (  3, 169, 244),
-          (  0, 188, 212),
-          (  0, 150, 136),
-          ( 76, 175,  80),
-          (139, 195,  74),
-          (205, 220,  57),
-          (255, 235,  59),
-          (255, 193,   7),
-          (255, 152,   0),
-          (255,  87,  34),
-          (121,  85,  72),
-          (158, 158, 158),
-          ( 96, 125, 139))
-
 
 # These are in BGR and are for ImageNet
 MEANS = (103.94, 116.78, 123.68)
 STD   = (57.38, 57.12, 58.40)
-
-COCO_CLASSES = ('person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
-                'train', 'truck', 'boat', 'traffic light', 'fire hydrant',
-                'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog',
-                'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe',
-                'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
-                'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat',
-                'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
-                'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl',
-                'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot',
-                'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
-                'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop',
-                'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven',
-                'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase',
-                'scissors', 'teddy bear', 'hair drier', 'toothbrush')
-
-COCO_LABEL_MAP = { 1:  1,  2:  2,  3:  3,  4:  4,  5:  5,  6:  6,  7:  7,  8:  8,
-                   9:  9, 10: 10, 11: 11, 13: 12, 14: 13, 15: 14, 16: 15, 17: 16,
-                  18: 17, 19: 18, 20: 19, 21: 20, 22: 21, 23: 22, 24: 23, 25: 24,
-                  27: 25, 28: 26, 31: 27, 32: 28, 33: 29, 34: 30, 35: 31, 36: 32,
-                  37: 33, 38: 34, 39: 35, 40: 36, 41: 37, 42: 38, 43: 39, 44: 40,
-                  46: 41, 47: 42, 48: 43, 49: 44, 50: 45, 51: 46, 52: 47, 53: 48,
-                  54: 49, 55: 50, 56: 51, 57: 52, 58: 53, 59: 54, 60: 55, 61: 56,
-                  62: 57, 63: 58, 64: 59, 65: 60, 67: 61, 70: 62, 72: 63, 73: 64,
-                  74: 65, 75: 66, 76: 67, 77: 68, 78: 69, 79: 70, 80: 71, 81: 72,
-                  82: 73, 84: 74, 85: 75, 86: 76, 87: 77, 88: 78, 89: 79, 90: 80}
-
-
 
 # ----------------------- CONFIG CLASS ----------------------- #
 
@@ -242,80 +51,6 @@ class Config(object):
 
 
 
-
-# ----------------------- DATASETS ----------------------- #
-
-dataset_base = Config({
-    'name': 'Base Dataset',
-
-    # Training images and annotations
-    'train_images': './data/coco/images/',
-    'train_info':   'path_to_annotation_file',
-
-    # Validation images and annotations.
-    'valid_images': './data/coco/images/',
-    'valid_info':   'path_to_annotation_file',
-
-    # Whether or not to load GT. If this is False, eval.py quantitative evaluation won't work.
-    'has_gt': True,
-
-    # A list of names for each of you classes.
-    'class_names': COCO_CLASSES,
-
-    # COCO class ids aren't sequential, so this is a bandage fix. If your ids aren't sequential,
-    # provide a map from category_id -> index in class_names + 1 (the +1 is there because it's 1-indexed).
-    # If not specified, this just assumes category ids start at 1 and increase sequentially.
-    'label_map': None
-})
-
-coco2014_dataset = dataset_base.copy({
-    'name': 'COCO 2014',
-    
-    'train_info': './data/coco/annotations/instances_train2014.json',
-    'valid_info': './data/coco/annotations/instances_val2014.json',
-
-    'label_map': COCO_LABEL_MAP
-})
-
-coco2017_dataset = dataset_base.copy({
-    'name': 'COCO 2017',
-    
-    'train_info': './data/coco/annotations/instances_train2017.json',
-    'valid_info': './data/coco/annotations/instances_val2017.json',
-
-    'label_map': COCO_LABEL_MAP
-})
-
-coco2017_testdev_dataset = dataset_base.copy({
-    'name': 'COCO 2017 Test-Dev',
-
-    'valid_info': './data/coco/annotations/image_info_test-dev2017.json',
-    'has_gt': False,
-
-    'label_map': COCO_LABEL_MAP
-})
-
-PASCAL_CLASSES = ("aeroplane", "bicycle", "bird", "boat", "bottle",
-                  "bus", "car", "cat", "chair", "cow", "diningtable",
-                  "dog", "horse", "motorbike", "person", "pottedplant",
-                  "sheep", "sofa", "train", "tvmonitor")
-
-pascal_sbd_dataset = dataset_base.copy({
-    'name': 'Pascal SBD 2012',
-
-    'train_images': './data/sbd/img',
-    'valid_images': './data/sbd/img',
-    
-    'train_info': './data/sbd/pascal_sbd_train.json',
-    'valid_info': './data/sbd/pascal_sbd_val.json',
-
-    'class_names': PASCAL_CLASSES,
-})
-
-
-
-
-
 # ----------------------- TRANSFORMS ----------------------- #
 
 resnet_transform = Config({
@@ -324,26 +59,6 @@ resnet_transform = Config({
     'subtract_means': False,
     'to_float': False,
 })
-
-vgg_transform = Config({
-    # Note that though vgg is traditionally BGR,
-    # the channel order of vgg_reducedfc.pth is RGB.
-    'channel_order': 'RGB',
-    'normalize': False,
-    'subtract_means': True,
-    'to_float': False,
-})
-
-darknet_transform = Config({
-    'channel_order': 'RGB',
-    'normalize': False,
-    'subtract_means': False,
-    'to_float': True,
-})
-
-
-
-
 
 # ----------------------- BACKBONES ----------------------- #
 
@@ -373,6 +88,11 @@ resnet101_backbone = backbone_base.copy({
     'selected_layers': list(range(2, 8)),
     'pred_scales': [[1]]*6,
     'pred_aspect_ratios': [ [[0.66685089, 1.7073535, 0.87508774, 1.16524493, 0.49059086]] ] * 6,
+})
+
+resnet101_dcn_inter3_backbone = resnet101_backbone.copy({
+    'name': 'ResNet101_DCN_Interval3',
+    'args': ([3, 4, 23, 3], [0, 4, 23, 3], 3),
 })
 
 
@@ -431,7 +151,7 @@ fpn_base = Config({
 # ----------------------- CONFIG DEFAULTS ----------------------- #
 
 coco_base_config = Config({
-    'dataset': coco2014_dataset,
+    # 'dataset': coco2014_dataset,
     'num_classes': 81, # This should include the background class
 
     'max_iter': 400000,
@@ -585,78 +305,29 @@ coco_base_config = Config({
     # The rest are neutral and not used in calculating the loss.
     'positive_iou_threshold': 0.5,
     'negative_iou_threshold': 0.5,
-
-    # When using ohem, the ratio between positives and negatives (3 means 3 negatives to 1 positive)
     'ohem_negpos_ratio': 3,
-
-    # If less than 1, anchors treated as a negative that have a crowd iou over this threshold with
-    # the crowd boxes will be treated as a neutral.
     'crowd_iou_threshold': 1,
-
-    # This is filled in at runtime by Yolact's __init__, so don't touch it
     'mask_dim': None,
-
-    # Input image size.
     'max_size': 300,
-    
-    # Whether or not to do post processing on the cpu at test time
     'force_cpu_nms': True,
-
-    # Whether to use mask coefficient cosine similarity nms instead of bbox iou nms
     'use_coeff_nms': False,
-
-    # Whether or not to have a separate branch whose sole purpose is to act as the coefficients for coeff_diversity_loss
-    # Remember to turn on coeff_diversity_loss, or these extra coefficients won't do anything!
-    # To see their effect, also remember to turn on use_coeff_nms.
     'use_instance_coeff': False,
     'num_instance_coeffs': 64,
-
-    # Whether or not to tie the mask loss / box loss to 0
     'train_masks': True,
     'train_boxes': True,
-    # If enabled, the gt masks will be cropped using the gt bboxes instead of the predicted ones.
-    # This speeds up training time considerably but results in much worse mAP at test time.
     'use_gt_bboxes': False,
-
-    # Whether or not to preserve aspect ratio when resizing the image.
-    # If True, this will resize all images to be max_size^2 pixels in area while keeping aspect ratio.
-    # If False, all images are resized to max_size x max_size
     'preserve_aspect_ratio': False,
-
-    # Whether or not to use the prediction module (c) from DSSD
     'use_prediction_module': False,
-
-    # Whether or not to use the predicted coordinate scheme from Yolo v2
     'use_yolo_regressors': False,
-    
-    # For training, bboxes are considered "positive" if their anchors have a 0.5 IoU overlap
-    # or greater with a ground truth box. If this is true, instead of using the anchor boxes
-    # for this IoU computation, the matching function will use the predicted bbox coordinates.
-    # Don't turn this on if you're not using yolo regressors!
     'use_prediction_matching': False,
-
-    # A list of settings to apply after the specified iteration. Each element of the list should look like
-    # (iteration, config_dict) where config_dict is a dictionary you'd pass into a config object's init.
     'delayed_settings': [],
-
-    # Use command-line arguments to set this.
     'no_jit': False,
 
     'backbone': None,
     'name': 'base_config',
-
-    # Fast Mask Re-scoring Network
-    # Inspried by Mask Scoring R-CNN (https://arxiv.org/abs/1903.00241)
-    # Do not crop out the mask with bbox but slide a convnet on the image-size mask,
-    # then use global pooling to get the final mask score
     'use_maskiou': False,
-    
-    # Archecture for the mask iou network. A (num_classes-1, 1, {}) layer is appended to the end.
     'maskiou_net': [],
-
-    # Discard predicted masks whose area is less than this
     'discard_mask_area': -1,
-
     'maskiou_alpha': 1.0,
     'rescore_mask': False,
     'rescore_bbox': False,
@@ -664,17 +335,10 @@ coco_base_config = Config({
 })
 
 
-
-
-
 # ----------------------- YOLACT v1.0 CONFIGS ----------------------- #
 
 yolact_base_config = coco_base_config.copy({
     'name': 'yolact_base',
-
-    # Dataset stuff
-    'dataset': coco2017_dataset,
-    'num_classes': len(coco2017_dataset.class_names) + 1,
 
     # Image Size
     'max_size': 550,
@@ -719,8 +383,32 @@ yolact_base_config = coco_base_config.copy({
     'use_semantic_segmentation_loss': True,
 })
 
+# ----------------------- YOLACT++ CONFIGS ----------------------- #
 
-# Default config
+yolact_plus_base_config = yolact_base_config.copy({
+    'name': 'yolact_plus_base',
+
+    'backbone': resnet101_dcn_inter3_backbone.copy({
+        'selected_layers': list(range(1, 4)),
+        
+        'pred_aspect_ratios': [ [[1, 1/2, 2]] ]*5,
+        'pred_scales': [[i * 2 ** (j / 3.0) for j in range(3)] for i in [24, 48, 96, 192, 384]],
+        'use_pixel_scales': True,
+        'preapply_sqrt': False,
+        'use_square_anchors': False,
+    }),
+
+    'use_maskiou': True,
+    'maskiou_net': [(8, 3, {'stride': 2}), (16, 3, {'stride': 2}), (32, 3, {'stride': 2}), (64, 3, {'stride': 2}), (128, 3, {'stride': 2})],
+    'maskiou_alpha': 25,
+    'rescore_bbox': False,
+    'rescore_mask': True,
+
+    'discard_mask_area': 5*5,
+})
+
+
+# # Default config
 cfg = yolact_base_config.copy()
 
 def set_cfg(config_name:str):

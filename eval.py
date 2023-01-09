@@ -1,17 +1,16 @@
-import torch
-from math import sqrt
-import torch.nn.functional as F
-import warnings
-warnings.filterwarnings("ignore")
-
-import numpy as np
-import torch, sys, cv2
-import torch.backends.cudnn as cudnn
-
 from utils.yolact import Yolact
 from utils.output_utils import postprocess
-from utils.config import cfg
+from utils.config import cfg, set_cfg
 
+import numpy as np
+import torch, sys
+import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
+
+from math import sqrt
+import cv2
+import warnings
+warnings.filterwarnings("ignore")
 
 def calc_size_preserve_ar(img_w, img_h, max_size):
     ratio = sqrt(img_w / img_h)
@@ -23,9 +22,12 @@ class FastBaseTransform(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-
-        self.mean = torch.Tensor((103.94, 116.78, 123.68)).float().cuda()[None, :, None, None]
-        self.std  = torch.Tensor( (57.38, 57.12, 58.40) ).float().cuda()[None, :, None, None]
+        if torch.cuda.is_available():
+            self.mean = torch.Tensor((103.94, 116.78, 123.68)).float().cuda()[None, :, None, None]
+            self.std  = torch.Tensor( (57.38, 57.12, 58.40) ).float().cuda()[None, :, None, None]
+        else:
+            self.mean = torch.Tensor((103.94, 116.78, 123.68)).float()[None, :, None, None]
+            self.std  = torch.Tensor( (57.38, 57.12, 58.40) ).float()[None, :, None, None]
         self.transform = cfg.backbone.transform
 
     def forward(self, img):
@@ -58,7 +60,8 @@ class FastBaseTransform(torch.nn.Module):
         return img
 
 def evalimage(net:Yolact, path:str):
-    frame = torch.from_numpy(cv2.imread(path)).cuda().float()
+    
+    frame = torch.from_numpy(cv2.imread(path)).cuda().float() if torch.cuda.is_available() else torch.from_numpy(cv2.imread(path)).float()
     batch = FastBaseTransform()(frame.unsqueeze(0))
     preds = net(batch)
     h, w, _ = frame.shape
@@ -75,10 +78,13 @@ def evaluate(net:Yolact):
     evalimage(net, inp)
     return
 
+
+
 if __name__ == '__main__':
 
+    set_cfg("yolact_plus_base_config")
+
     with torch.no_grad():
-        
         if torch.cuda.is_available():
             cudnn.fastest = True
             torch.set_default_tensor_type('torch.cuda.FloatTensor')
@@ -87,7 +93,7 @@ if __name__ == '__main__':
 
         print('Generating masks...', end='')
         net = Yolact()
-        net.load_weights("yolact_base_54_800000.pth")
+        net.load_weights("yolact_plus_base_54_800000.pth")
         net.eval()
 
         if torch.cuda.is_available():

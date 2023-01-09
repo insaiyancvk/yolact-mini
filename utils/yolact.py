@@ -8,12 +8,11 @@ from math import sqrt
 from typing import List
 from collections import defaultdict
 
-from .config import cfg, mask_type
-from .output_utils import Detect, construct_backbone, make_net
+from utils.config import cfg, mask_type
+from utils.output_utils import Detect, construct_backbone, make_net
 
 # import torch.backends.cudnn as cudnn
-from . import timer
-# from output_utils import MovingAverage, 
+from utils.timer import *
 
 # This is required for Pytorch 1.0.1 on Windows to initialize Cuda on some driver versions.
 # See the bug report here: https://github.com/pytorch/pytorch/issues/17108
@@ -26,19 +25,6 @@ if not use_jit:
 
 ScriptModuleWrapper = torch.jit.ScriptModule if use_jit else nn.Module
 script_method_wrapper = torch.jit.script_method if use_jit else lambda fn, _rcn=None: fn
-
-
-
-class Concat(nn.Module):
-    def __init__(self, nets, extra_params):
-        super().__init__()
-
-        self.nets = nn.ModuleList(nets)
-        self.extra_params = extra_params
-    
-    def forward(self, x):
-        # Concat each along the channel dimension
-        return torch.cat([net(x) for net in self.nets], dim=1, **self.extra_params)
 
 prior_cache = defaultdict(lambda: None)
 
@@ -214,7 +200,7 @@ class PredictionModule(nn.Module):
         global prior_cache
         size = (conv_h, conv_w)
 
-        with timer.env('makepriors'):
+        with env('makepriors'):
             if self.last_img_size != (cfg._tmp_img_w, cfg._tmp_img_h):
                 prior_data = []
 
@@ -568,18 +554,18 @@ class Yolact(nn.Module):
         cfg._tmp_img_h = img_h
         cfg._tmp_img_w = img_w
         
-        with timer.env('backbone'):
+        with env('backbone'):
             outs = self.backbone(x)
 
         if cfg.fpn is not None:
-            with timer.env('fpn'):
+            with env('fpn'):
                 # Use backbone.selected_layers because we overwrote self.selected_layers
                 outs = [outs[i] for i in cfg.backbone.selected_layers]
                 outs = self.fpn(outs)
 
         proto_out = None
         if cfg.mask_type == mask_type.lincomb and cfg.eval_mask_branch:
-            with timer.env('proto'):
+            with env('proto'):
                 proto_x = x if self.proto_src is None else outs[self.proto_src]
                 
                 if self.num_grids > 0:
@@ -605,7 +591,7 @@ class Yolact(nn.Module):
                     proto_out = torch.cat([proto_out, torch.ones(*bias_shape)], -1)
 
 
-        with timer.env('pred_heads'):
+        with env('pred_heads'):
             pred_outs = { 'loc': [], 'conf': [], 'mask': [], 'priors': [] }
 
             if cfg.use_mask_scoring:

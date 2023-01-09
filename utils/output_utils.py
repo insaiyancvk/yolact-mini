@@ -4,8 +4,18 @@ import torch.nn.functional as F
 import math
 from collections import deque
 from .config import cfg, mask_type
-# from utils import timer
 from .box_utils import crop, sanitize_coordinates, jaccard
+
+class Concat(nn.Module):
+    def __init__(self, nets, extra_params):
+        super().__init__()
+
+        self.nets = nn.ModuleList(nets)
+        self.extra_params = extra_params
+    
+    def forward(self, x):
+        # Concat each along the channel dimension
+        return torch.cat([net(x) for net in self.nets], dim=1, **self.extra_params)
 
 def postprocess(det_output, w, h, batch_idx=0, interpolation_mode='bilinear',
                 crop_masks=True, score_threshold=0):
