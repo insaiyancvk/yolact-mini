@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 try:
-    from .dcn_v2 import DCN
+    from utils.dcn_v2 import DCN
     
 except ImportError:
     def DCN(*args, **kwdargs):

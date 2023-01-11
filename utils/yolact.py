@@ -1,4 +1,4 @@
-import torch #, torchvision
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.resnet import Bottleneck
@@ -10,8 +10,6 @@ from collections import defaultdict
 
 from utils.config import cfg, mask_type
 from utils.output_utils import Detect, construct_backbone, make_net
-
-# import torch.backends.cudnn as cudnn
 from utils.timer import *
 
 # This is required for Pytorch 1.0.1 on Windows to initialize Cuda on some driver versions.
